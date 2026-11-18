@@ -1,4 +1,4 @@
-"""Forecast GTA VI's launch-day Twitch viewers, hour by hour.
+"""Forecast GTA VI's launch-day Twitch viewers, hour by hour (v2).
 
 For each hour h = 2..24 of the UTC release day, the program fits, on the
 past launches in the case's own comparables, a small log-linear model of
@@ -12,12 +12,34 @@ the 7 days before release day, ch1 its hour-1 channel count, and dst a
 unlock lands an hour later once daylight saving ends). The early hours
 track hour 1 almost one-for-one (b near 1); the daytime peak barely does
 (b near 0) and is instead carried by the pre-release baseline, which is
-why the baseline is in the model. Quantiles come from the fit's own
-residuals (empirical quantiles at the five scored levels), and the median
-is blended 20% toward the plain median-ratio profile, which steadies the
-hours where the fit has few comparables. Everything is computed from the
-case file at run time, so the same program generalises to the final case.
-Deterministic: no randomness, no network, standard library only.
+why the baseline is in the model.
+
+v2 changes (chosen by leave-one-comparable-out cross-validation on the
+case's own 38 comparables, scoring the pinball loss on the log scale
+against each held-out launch's true day; big launches, hour-1 >= 20,000,
+are the relevant population for this final, so they are the metric):
+
+1. The median is blended 65% toward the plain median-ratio profile
+   (v1: 20%). The OLS median extrapolates badly in log(p1) for a launch
+   far bigger than most comparables; the scale-free ratio profile is far
+   steadier for big launches. Big-launch LOCO loss: 0.3115 -> 0.2680.
+2. The ratio profile is built only from comparables with hour-1 >= 20,000
+   (27 of 38; falls back to all comparables when fewer than 12 qualify).
+   Small launches spike much harder relative to hour 1 and their day
+   shape is systematically different, so they pull the profile's late-day
+   ratios up and make big launches over-predicted after hour 20.
+   Big-launch LOCO loss: 0.2680 -> 0.2549; big-launch median bias
+   -0.085 -> +0.045 log points, mean |log error| 0.412 -> 0.400.
+3. Quantiles come from the fit's own in-sample residuals, narrowed 15%
+   toward the blended median (SPREAD_SCALE 0.85). Leave-one-out residuals
+   were tried and rejected: they are inflated by small launches' odd
+   shapes and made big-launch loss worse (0.2680 -> 0.3131). The
+   in-sample spread slightly over-covers big launches (90% coverage
+   0.95), and the 0.85 factor brings it to 0.92.
+
+Everything is computed from the case file at run time, so the same program
+generalises to the final case. Deterministic: no randomness, no network,
+standard library only.
 
 Interface (same as the kit's starter): read every <id>.in in the input
 directory, write one <id>.out per case with {"hours": [{"hour": h, "q":
@@ -41,9 +63,15 @@ OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0, 0.674, 1.645]
 
-# Median blend toward the plain ratio profile, and the minimum number of
-# comparables a per-hour fit needs before falling back to that profile.
-RATIO_BLEND = 0.2
+# Median blend toward the ratio profile, the minimum number of
+# comparables a per-hour fit needs before falling back to that profile,
+# and the spread scale applied to the residual quantiles.
+RATIO_BLEND = 0.65
+SPREAD_SCALE = 0.85
+# Ratio-profile pool: only comparables at least this big in hour 1.
+# Small launches have a systematically different day shape.
+RATIO_MIN_P1 = 20000
+MIN_RATIO_POOL = 12
 MIN_FIT_ROWS = 12
 MIN_DAY_HOURS = 20
 BASE_WINDOW_HOURS = 7 * 24
@@ -154,13 +182,31 @@ def case_baseline(case):
     return sum(pre) / len(pre) if pre else None
 
 
+def ratio_pool(stats, h):
+    """Comparables usable for the ratio profile at hour h.
+
+    Big launches only (hour-1 >= RATIO_MIN_P1); falls back to every
+    comparable with this hour when fewer than MIN_RATIO_POOL qualify.
+    """
+    pool = [prof for prof, _, _, _ in stats if h in prof and 1 in prof]
+    big = [prof for prof in pool if prof[1] >= RATIO_MIN_P1]
+    return big if len(big) >= MIN_RATIO_POOL else pool
+
+
 def ratio_quantiles(stats, p1, h):
-    """Quantiles of log(y_h / y_1) across comparables, anchored on p1."""
-    lrs = sorted(math.log(prof[h] / prof[1])
-                 for prof, _, _, _ in stats if h in prof and 1 in prof)
+    """Quantiles of log(y_h / y_1) across the ratio pool, anchored on p1."""
+    lrs = sorted(math.log(prof[h] / prof[1]) for prof in ratio_pool(stats, h))
     if not lrs:
         return None
     return [max(1.0, p1 * math.exp(quantile(lrs, t))) for t in LEVELS]
+
+
+def ratio_median(stats, p1, h):
+    """Median log(y_h) implied by the ratio profile, anchored on p1."""
+    lrs = sorted(math.log(prof[h] / prof[1]) for prof in ratio_pool(stats, h))
+    if not lrs:
+        return None
+    return math.log(p1) + quantile(lrs, 0.5)
 
 
 def persistence_quantiles(p1, h):
@@ -191,29 +237,31 @@ def forecast_case(case, name):
         if h == 1:
             continue
         # Per-hour regression on the comparables that have this hour.
-        rows = []
+        entries = []
         for prof, base_c, ch_c, dst_c in stats:
             if h not in prof or not base_c or not ch_c:
                 continue
-            rows.append(([math.log(prof[1]), math.log(base_c), math.log(ch_c), dst_c],
-                         math.log(prof[h])))
+            entries.append(([math.log(prof[1]), math.log(base_c), math.log(ch_c), dst_c],
+                            math.log(prof[h])))
         quantiles = None
-        if len(rows) >= MIN_FIT_ROWS:
-            coef, resid = ols([r[0] for r in rows], [r[1] for r in rows])
+        if len(entries) >= MIN_FIT_ROWS:
+            coef, resid = ols([e[0] for e in entries], [e[1] for e in entries])
             if coef is not None:
                 xt = [math.log(p1),
-                      math.log(base_t) if base_t else sum(r[0][1] for r in rows) / len(rows),
-                      math.log(ch1) if ch1 else sum(r[0][2] for r in rows) / len(rows),
+                      math.log(base_t) if base_t else sum(e[0][1] for e in entries) / len(entries),
+                      math.log(ch1) if ch1 else sum(e[0][2] for e in entries) / len(entries),
                       dst_t]
                 mu = coef[0] + sum(coef[j + 1] * xt[j] for j in range(4))
+                # Blend the median toward the ratio profile (big launches
+                # only), and take the spread from the fit's residuals,
+                # narrowed toward the blended median.
+                med_r = ratio_median(stats, p1, h)
+                if med_r is None:
+                    med_r = mu
+                mu_b = (1 - RATIO_BLEND) * mu + RATIO_BLEND * med_r
                 sres = sorted(resid)
                 qs = [mu + quantile(sres, t) for t in LEVELS]
-                # Blend the median toward the plain ratio profile.
-                rq = ratio_quantiles(stats, p1, h)
-                if rq is not None:
-                    med_r = math.log(max(rq[2], 1.0))
-                    mu_b = (1 - RATIO_BLEND) * mu + RATIO_BLEND * med_r
-                    qs = [mu_b + (q - mu) for q in qs]
+                qs = [mu_b + SPREAD_SCALE * (q - mu) for q in qs]
                 quantiles = [max(1.0, math.exp(q)) for q in qs]
         if quantiles is None:
             quantiles = ratio_quantiles(stats, p1, h)
